@@ -1951,6 +1951,218 @@ unittest
 }
 
 /**
+    Projects a value through the set of types contained within an `Algebraic`. 
+    Each type must have a member with a name corresponding to the value of 
+    `sym`, and must be of the same type or implicitly convertible to a common
+    type. This function is useful when it is known that all types within an 
+    `Algebraic` contain a similar member, as exhaustively checking each 
+    type using `visit` just to return the same thing in each case can be
+    tedious.
+
+    Note:
+        Currently only member variables, `@property` functions, member 
+        functions that take no arguments, and variadic functions that can be 
+        called with no arguments are supported. Template functions are also
+        not supported, but these restrictions may be lifted in the future.
+
+    Params:
+        sym = The name of the symbol to "project" through the types of the 
+        `Algebraic`.
+
+        algebraic = An `Algebraic`.
+
+    Returns:
+        The value of the member named `sym`.
+
+    Throws:
+        $(LREF VariantException) if `algebraic.hasValue` is false.
+ */
+auto project(string sym, A)(auto ref A algebraic)
+if (isAlgebraic!A)
+{   
+    import std.traits: CommonType, hasMember, Select;
+    import std.typetuple: allSatisfy, staticMap;
+    import std.string: format;
+    
+    alias AlgTypes = algebraic.AllowedTypes;
+    enum stringA = "Algebraic!%s".format(AlgTypes.stringof);
+    enum partErrMsg = "Cannot project through '%s': ".format(stringA);
+
+    //Accessing an empty Algebraic is not a logic error
+    enforce!VariantException(algebraic.hasValue, "Called project on an empty '%s'".format(stringA));
+    
+    //Make sure every type in A has a member that matches sym
+    template hasSym(T)
+    {
+        static assert(hasMember!(T, sym), partErrMsg ~ "Type '%s' does not have member '%s'.".format(T.stringof, sym));
+        enum hasSym = true;
+    }
+    static assert(allSatisfy!(hasSym, AlgTypes));
+
+    template hasFunctionSym(T)
+    {
+        static assert(!__traits(isTemplate, __traits(getMember, T, sym)),
+            partErrMsg ~ "Type '%s' member '%s' is a template function, which is not supported".format(T.stringof, sym));
+        enum hasFunctionSym = isSomeFunction!(__traits(getMember, T, sym));
+    }
+    enum symIsFunction = allSatisfy!(hasFunctionSym, AlgTypes);
+
+    template SymType(T)
+    {
+        //Avoid the "local variable to non-global template" problem
+        enum getMember = "__traits(getMember, T, sym)";
+
+        //If member is a function, it cannot take any arguments, or, 
+        //if it is variadic, it must be callable with 0 arguments
+        static if(symIsFunction)
+        {
+            static if (variadicFunctionStyle!(mixin(getMember)) == Variadic.no)
+            {
+                static assert(arity!(mixin(getMember)) == 0, partErrMsg ~ "Functions taking more than 0 arguments are not supported");
+            }
+            else
+            {
+                static assert(is(typeof(mixin(getMember ~ "()"))), 
+                    partErrMsg ~ "Variadic functions that cannot be called with 0 arguments are not supported");
+            }
+            alias SymType = ReturnType!(mixin(getMember));
+        }
+        else
+        {
+            alias SymType = typeof(mixin(getMember));
+        }    
+    }
+
+    //Get the type of every sym in AlgTypes and find their common type
+    alias AllSymTypes = staticMap!(SymType, AlgTypes);
+    alias CommonSymType = CommonType!AllSymTypes;
+    enum symTypesErrMsg = partErrMsg ~ "All members named '%s' must be of the same type".format(sym);
+    static if (symIsFunction && is(CommonSymType == void))
+    {
+        enum isVoid(T) = is(T == void);
+        enum allReturnTypesVoid = allSatisfy!(isVoid, AllSymTypes);
+        static assert(allReturnTypesVoid, symTypesErrMsg);
+    }
+    else
+    {
+        static assert(!is(CommonSymType == void), symTypesErrMsg);
+    }
+
+    foreach (AlgT; AlgTypes)
+    {
+        //This will only be execute for 1 type as an 
+        //Algebraic can only have 1 value at a time.
+        //Need Unqual here because of a bug in Algebraic
+        if (auto val = algebraic.peek!(Unqual!AlgT))
+        {
+            return cast(CommonSymType)__traits(getMember, *val, sym);
+        }
+    }
+    //This should never be reached, because we checked hasValue above
+    assert(0, "Expected '%s' to have a value, but it didn't".format(stringA));  
+}
+
+///
+unittest
+{
+    struct Foo
+    {
+        int val;
+
+        @property int doubled() { return val * 2; }
+        void reset() { val = int.init; }
+        float floatify() { return val; }
+        void variadic(int[] a...) {}
+        void templateFun(T)(T t) {}
+
+        void fooSpecific() {}
+    }
+
+    struct Bar
+    {
+        float val;
+
+        @property float doubled() { return val * 2; }
+        void reset() { val = float.nan; }
+        float floatify() { return val; }
+        void variadic(int[] a...) {}
+        void templateFun(T)(T t) {}
+    }
+
+    struct Baz
+    {
+        real val;
+
+        @property real doubled() { return val * 2; }
+        void reset() { val = real.nan; }
+        float floatify() 
+        {
+            assert(val > float.max, "Out of range");
+
+            return cast(float)val;
+        }
+        void variadic(int[] a...) {}
+        void templateFun(T)(T t) {}
+    }
+
+    alias FooBarBaz = Algebraic!(Foo, Bar, Baz);
+
+    FooBarBaz fbb = Foo(2);
+    //Only members that belong to every type in the Algebraic can be projected
+    static assert(!__traits(compiles, { auto b = fbb.project!"fooSpecific"; }));
+
+    //Template functions are currently not supported
+    static assert(!__traits(compiles, { fbb.project!"templateFun"; }));
+
+    //Member functions are supported as long as they take no arguments
+    auto floaty = fbb.project!"floatify";
+    assert(floaty == 2.0f);
+    fbb.project!"reset";
+    assert(fbb.project!"floatify" == 0.0f);
+
+    fbb = Bar(4.0f);
+
+    //Property functions are also supported
+    auto doubled = fbb.project!"doubled";
+
+    //The returned value will have the common type
+    //of all the members with the name "doubled"
+    assert(is(typeof(doubled) == real));
+    assert(doubled == 8.0);
+
+    //Member variables are supported as well and are returned as the 
+    //common type of all the members named "val", just as with functions
+    auto val = fbb.project!"val";
+    assert(is(typeof(val) == real));
+    assert(val == 4.0);
+
+    //Type safe variadic functions are also supported
+    fbb.project!"variadic";
+}
+
+//Test const methods and returning const
+unittest
+{
+    struct Foo { float floatify() { return 0; } }
+
+    struct Bar
+    {
+        float floatify() { return 0; }
+        const(float) floatify() const { return 0; }
+    }
+
+    struct Baz { float floatify() { return 0; } }
+
+    alias FooBarBaz = Algebraic!(Foo, const Bar, Baz);
+
+    FooBarBaz fbb = Bar();
+    auto val = fbb.project!"floatify";
+    assert(val == 0);
+    assert(is(typeof(val) == float));
+}
+
+
+/**
  * Applies a delegate or function to the given Algebraic depending on the held type,
  * ensuring that all types are handled by the visiting functions.
  *
