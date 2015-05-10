@@ -1455,3 +1455,463 @@ template forward(args...)
     auto x2 = bar(value); // case of OK
 }
 
+private alias isSomeStringType(alias str) = isSomeString!(typeof(str));
+
+template forwardToMember(alias member, symbols...)
+if (symbols.length > 0 && allSatisfy!(isSomeStringType, symbols))
+{
+    static if (symbols.length == 1)
+    {
+        static assert(hasMember!(typeof(member), symbols[0]),
+            "Cannot dispatch: member '" ~ member.stringof ~
+                "' does not support method '" ~ symbols[0] ~ "'");
+
+        enum forwardToMember = genWrapperMixin!(member, symbols[0]);
+    }
+    else
+    {
+        enum forwardToMember = forwardToMember!(member, symbols[0]) ~ forwardToMember!(member, symbols[1..$]);
+    }
+}
+
+template forwardIfDefined(alias member, symbols...)
+if (symbols.length > 0 && allSatisfy!(isSomeStringType, symbols))
+{
+    static if (symbols.length == 1)
+    {
+        static if (hasMember!(typeof(member), symbols[0]))
+            enum forwardIfDefined = genWrapperMixin!(member, symbols[0]);
+        else
+            enum forwardIfDefined = "";
+    }
+    else
+    {
+        enum forwardIfDefined = forwardIfDefined!(member, symbols[0]) ~ forwardIfDefined!(member, symbols[1..$]);
+    }
+}
+
+private enum SymbolKind
+{
+    function_,
+    property,
+    templateFunction,
+    fieldFunction,
+    field,
+    aliasableSym,
+}
+
+//Ugly hack but there's no other way to do this
+private template isTemplateFunction(f...)
+if (f.length == 1)
+{
+    import std.algorithm: among, balancedParens, canFind, count;
+
+    static if (!__traits(isTemplate, f[0]))
+    {
+        enum isTemplateFunction = false;
+    }
+    else
+    {
+        enum fstr = f[0].stringof;
+
+        //A template function's .stringof is of the format <function name>(<template args>)(<function args>)
+        //so match on the number of brackets to determine whether it's a template function or not
+        enum isTemplateFunction = __traits(isTemplate, f)
+                                    && fstr.balancedParens('(', ')')
+                                    && (fstr.canFind("if")
+                                            || fstr.count!(c => cast(bool)c.among!('(', ')')) == 4);
+    }
+}
+
+unittest
+{
+    auto ref identity(T)(auto ref T t) { return t; }
+    //int intIdentity(int i) { return i; }
+    struct S(T) { T t; }
+
+    static assert(isTemplateFunction!identity);
+    //@@@BUG@@@: cannot call intIdentity with arguments ()
+    //static assert(!isTemplateFunction!intIdentity);
+    static assert(!isTemplateFunction!S);
+}
+
+private template getSymbolKind(Aggregate, string symbol)
+{
+    import std.traits;
+    import std.typetuple;
+
+    enum getMemberMixin = "Aggregate." ~ symbol;
+
+    //Appears in Aggregate.tupleof so it must be a field
+    static if (staticIndexOf!(symbol, FieldNameTuple!Aggregate) > -1)
+    {
+        //Check if it's a regular field or a function pointer
+        static if (isSomeFunction!(mixin(getMemberMixin)))
+            enum getSymbolKind = SymbolKind.fieldFunction;
+        else
+            enum getSymbolKind = SymbolKind.field;
+    }
+    else
+    {
+        static if (isSomeFunction!(mixin(getMemberMixin))
+                        && !__traits(isStaticFunction, mixin(getMemberMixin))
+                        || isTemplateFunction!(mixin(getMemberMixin)))
+        {
+            static if (isTemplateFunction!(mixin(getMemberMixin)))
+                enum getSymbolKind = SymbolKind.templateFunction;
+            else static if (functionAttributes!(mixin(getMemberMixin)) & FunctionAttribute.property)
+                enum getSymbolKind = SymbolKind.property;
+            else
+                enum getSymbolKind = SymbolKind.function_;
+        }
+        //If it's not a member function/property then it should be an aliasable static symbol
+        else static if (__traits(compiles, { alias _ = Alias!(mixin(getMemberMixin)); }))
+            enum getSymbolKind = SymbolKind.aliasableSym;
+        else
+            static assert(0, "Error: " ~ Aggregate.stringof ~ "." ~ symbol ~ " is not a member function, field, or aliasable symbol");
+    }
+}
+
+unittest
+{
+    struct T
+    {
+        int getN() { return n; }
+        static int get0() { return 0; }
+        @property int prop() { return 0; }
+        int function(int) f = (int i) => i;
+        int tf(T)(T t) { return 0; }
+        @property int propt(T)() { return T.init; }
+        int get0tc(T)() if (is(T == int)) { return 0; }
+        static int get0t(T)() { return T.init; }
+        int n;
+        template t(T) {}
+        enum x = 0;
+        alias a = n;
+        alias Type = int;
+        struct S(T) { T t; }
+    }
+
+    static assert(getSymbolKind!(T, "getN") == SymbolKind.function_);
+    static assert(getSymbolKind!(T, "get0") == SymbolKind.aliasableSym);
+    static assert(getSymbolKind!(T, "prop") == SymbolKind.property);
+    static assert(getSymbolKind!(T, "tf") == SymbolKind.templateFunction);
+    static assert(getSymbolKind!(T, "propt") == SymbolKind.templateFunction);
+    static assert(getSymbolKind!(T, "get0tc") == SymbolKind.templateFunction);
+    static assert(getSymbolKind!(T, "get0t") == SymbolKind.templateFunction);
+    static assert(getSymbolKind!(T, "f") == SymbolKind.fieldFunction);
+    static assert(getSymbolKind!(T, "n") == SymbolKind.field);
+    static assert(getSymbolKind!(T, "t") == SymbolKind.aliasableSym);
+    static assert(getSymbolKind!(T, "x") == SymbolKind.aliasableSym);
+    static assert(getSymbolKind!(T, "a") == SymbolKind.aliasableSym);
+    static assert(getSymbolKind!(T, "Type") == SymbolKind.aliasableSym);
+    static assert(getSymbolKind!(T, "S") == SymbolKind.aliasableSym);
+}
+
+private template genWrapperMixin(alias member, string symbol)
+{
+    import std.algorithm: among;
+    import std.string: format;
+
+    enum symbolKind = getSymbolKind!(typeof(member), symbol);
+
+    static if (symbolKind.among!(SymbolKind.function_, SymbolKind.property, SymbolKind.fieldFunction))
+    {
+        alias MethodType = FunctionTypeOf!(mixin("member." ~ symbol));
+        enum funAttrs = functionAttributes!MethodType;
+        enum methodIsStatic = __traits(isStaticFunction, mixin("member." ~ symbol));
+        enum funAttrStr = getFunctionAttributeStr(funAttrs) ~ (methodIsStatic ? " static" : "");
+
+        //Workaround Issue 14913
+        enum returnStr = funAttrs & FunctionAttribute.return_ ? "return" : "";
+
+        enum genWrapperMixin = q{
+            %3$s
+            auto ref %2$s(ParameterTypeTuple!(FunctionTypeOf!(%1$s.%2$s)) args) %4$s
+            {
+                import std.functional: forward;
+
+                return %1$s.%2$s(forward!args);
+            }
+        }
+        .format(member.stringof, symbol, funAttrStr, returnStr);
+    }
+    else static if (symbolKind == SymbolKind.templateFunction)
+    {
+        enum genWrapperMixin =  q{
+            template %2$s(TemplateArgs...)
+            {
+                auto ref %2$s(FunArgs...)(auto ref FunArgs args)
+                {
+                    import std.functional: forward;
+
+                    return %1$s.%2$s!(TemplateArgs)(forward!args);
+                }
+            }
+        }
+        .format(member.stringof, symbol);
+    }
+    else static if (symbolKind == SymbolKind.field)
+    {
+        alias FieldType = typeof(mixin("member." ~ symbol));
+        alias FA = FunctionAttribute;
+        enum attrStr = getFunctionAttributeStr(FA.pure_ | FA.nothrow_ | FA.safe | FA.nogc);
+        enum canGet = __traits(compiles, { mixin("auto _ = typeof(member).init." ~ symbol ~ ";"); });
+        enum canSet = __traits(compiles, { mixin("auto _ = typeof(member).init; _." ~ symbol ~ " = FieldType.init;"); });
+        enum genWrapperMixin = q{
+            static if (%5$s)
+            @property %3$s %4$s %1$s()
+            {
+                return %2$s.%1$s;
+            }
+
+            static if (%6$s)
+            @property %3$s void %1$s(%4$s val)
+            {
+                %2$s.%1$s = val;
+            }
+        }
+        .format(symbol, member.stringof, attrStr, FieldType.stringof, canGet, canSet);
+    }
+    else static if (symbolKind == SymbolKind.aliasableSym)
+    {
+        enum genWrapperMixin = q{
+            alias %1$s = %2$s.%1$s;
+        }
+        .format(symbol, member.stringof);
+    }
+    else
+        static assert(member.stringof ~ "." ~ symbol ~ " has unexpected kind '" ~ symbolKind.to!string ~ "'");
+}
+
+private string getFunctionAttributeStr(FunctionAttribute funAttrs)
+{
+    import std.algorithm: among, filter, joiner, map, strip;
+    import std.conv: to;
+
+    string funAttrStr;
+    with (FunctionAttribute)
+    {
+        funAttrStr = [EnumMembers!FunctionAttribute]
+                        .filter!(e => (funAttrs & e) && e != none && e != ref_ && e != return_)
+                        .map!(e => e.to!string.strip('_'))
+                        .map!(s => s.among!("safe", "trusted", "system", "nogc", "property") ? '@' ~ s : s)
+                        .joiner(" ")
+                        .to!string;
+    }
+
+    return funAttrStr;
+}
+
+unittest
+{
+    struct Missing {}
+
+    static assert(!__traits(compiles,
+    {
+        struct MissingWrapper1
+        {
+            Missing t;
+
+            mixin(forwardToMember!(t, "fun"));
+        }
+    }));
+
+    struct MissingWrapper2
+    {
+        Missing t;
+
+        mixin(forwardIfDefined!(t, "fun"));
+    }
+
+    static assert(!__traits(compiles,
+    {
+        auto m = MissingWrapper2.init;
+        m.fun();
+    }));
+}
+
+unittest
+{
+    struct Wrapper(T)
+    {
+        T t;
+
+        mixin(forwardToMember!(t, "fun"));
+    }
+
+    alias fattrs = functionAttributes;
+    alias FA = FunctionAttribute;
+    enum allAttrs = FA.pure_ | FA.nothrow_ | FA.ref_ | FA.property | FA.trusted |
+                        FA.safe | FA.nogc | FA.system | FA.const_ | FA.immutable_ |
+                        FA.inout_ | FA.shared_ | FA.return_;
+
+    struct Foo
+    {
+        int fun(int n) { return n; }
+    }
+
+    assert(Wrapper!Foo().fun(2) == 2);
+
+    enum fooFattrs = fattrs!(Wrapper!Foo.fun);
+    assert(fooFattrs == FA.system);
+    assert(fooFattrs != (allAttrs - FA.system));
+
+    struct Bar
+    {
+        float fun(ref int n, float f, bool b) { return b? n : f; }
+    }
+
+    int n;
+    assert(Wrapper!Bar().fun(n, 1.0, false) == 1.0);
+
+    enum barAttrs = fattrs!(Wrapper!Bar.fun);
+    assert(barAttrs == FA.system);
+    assert(barAttrs != (allAttrs - FA.system));
+
+    struct Baz
+    {
+        static int fun() { return 0; }
+    }
+
+    assert(Wrapper!Baz.fun() == 0);
+
+    enum bazAttrs = fattrs!(Wrapper!Baz.fun);
+    assert(bazAttrs == FA.system);
+    assert(bazAttrs != (allAttrs - FA.system));
+    assert(__traits(isStaticFunction, Baz.fun));
+
+    struct Foo2
+    {
+        int fun(int n) pure nothrow @safe @nogc
+        {
+            return n;
+        }
+    }
+
+    assert(Wrapper!Foo2().fun(0) == 0);
+
+    enum foo2Attrs = fattrs!(Wrapper!Foo2.fun);
+    enum foo2Expected = FA.safe | FA.pure_ | FA.nothrow_ | FA.nogc;
+    assert(foo2Attrs == foo2Expected);
+    assert(foo2Attrs != (allAttrs - foo2Expected));
+
+    struct Bar2
+    {
+        @property int fun()
+        {
+            return 0;
+        }
+    }
+
+    assert(Wrapper!Bar2().fun == 0);
+
+    struct Baz2
+    {
+        ref int fun(return ref int n1, ref int n2) pure nothrow @safe @nogc const inout shared return
+        {
+            return n1;
+        }
+    }
+
+    int m = 2;
+    shared baz2 = Wrapper!Baz2();
+    assert(baz2.fun(m, m) == 2);
+
+    enum baz2Attrs = fattrs!(Wrapper!Baz2.fun);
+    enum baz2Expected = FA.pure_ | FA.nothrow_ | FA.safe | FA.nogc | FA.const_ | FA.ref_ |
+                            FA.inout_ | FA.shared_ | FA.return_ | FA.return_;
+    assert(baz2Attrs == baz2Expected);
+    assert(baz2Attrs != (allAttrs - baz2Expected));
+
+    struct Foo3
+    {
+        int    fun1(int n) { return n; }
+        float  fun2(ref int n, float f, bool b) { return b? n : f; }
+        static int fun3() { return 0; }
+
+        ref int fun4(return ref int n1, ref int n2) pure nothrow @safe @nogc const inout shared return
+        {
+            return n1;
+        }
+    }
+
+    struct WrappedFoo3
+    {
+        Foo3 t;
+
+        mixin(forwardToMember!(t, "fun1", "fun2", "fun3", "fun4"));
+    }
+    auto wf3 = WrappedFoo3();
+
+    assert(wf3.fun1(1) == 1);
+    assert(wf3.fun2(m, 0.0f, false) == 0.0f);
+    assert(WrappedFoo3.fun3() == 0);
+    assert((cast(shared)wf3).fun4(m, m) == 2);
+}
+
+unittest
+{
+    struct Foo
+    {
+        int function(int) fun = (int i) => i;
+        int _n;
+
+        @property n() { return _n + fudgeFactor; }
+        @property n(int _n) { this._n = _n; }
+
+        alias NType = typeof(_n);
+        enum fudgeFactor = 2;
+
+        template debugPrintFudgeFactor()
+        {
+            enum debugPrintFudgeFactor = true;
+        }
+    }
+
+    struct FooWrapper
+    {
+        Foo f;
+
+        mixin(forwardToMember!(f, "fun", "_n", "n", "NType", "fudgeFactor", "debugPrintFudgeFactor"));
+    }
+
+    FooWrapper fw;
+    assert(fw.fun(0) == 0);
+    assert(fw._n == 0);
+    assert(fw.n == 2);
+    assert(is(FooWrapper.NType == int));
+    assert(FooWrapper.fudgeFactor == 2);
+    assert(FooWrapper.debugPrintFudgeFactor!());
+}
+
+unittest
+{
+    import std.meta: allSatisfy;
+    import std.traits: isNumeric;
+
+    struct Foo
+    {
+        auto ref I(T)(auto ref T t) { return t; }
+
+        float test1(T...)(float f)
+        if (allSatisfy!(isNumeric, T))
+        {
+            return f;
+        }
+    }
+
+    struct FooWrapper
+    {
+        Foo f;
+
+        //pragma(msg, forwardToMember!(f, "I", "test1"));
+        mixin(forwardToMember!(f, "I", "test1"));
+    }
+
+    FooWrapper fw;
+    assert(fw.I(0) == 0);
+    assert(fw.test1!(int, float, double)(0.0f) == 0.0f);
+    assert(fw.test1(1.0f) == 1.0f);
+    static assert(!__traits(compiles, fw.test1!(bool)("asdf")));
+}
