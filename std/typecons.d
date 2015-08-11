@@ -1817,6 +1817,94 @@ Params:
     }
 
 /**
+Compares two `Nullable`s for equality. If either `Nullable` is in the
+null state, then the comparison will return false. Otherwise,
+the values contained within the `Nullable`s will be compared.
+
+returns:
+    For two `Nullable`s `n1` and `n2`:
+        $(UL
+            $(LI true if `n1` is null and `n2` is null.)
+            $(LI false if `n1` is null and `n2` is non-null.)
+            $(LI false if `n1` is non-null and `n2` is null.)
+            $(LI if `n1` is non-null and `n2` is non-null,
+                 returns the result of the expression `n1.get() == n2.get()`.)
+        )
+*/
+    bool opEquals(inout(Nullable) other) inout
+    {
+        if (this.isNull && other.isNull)
+        {
+            return true;
+        }
+        else if (!(this.isNull || other.isNull))
+        {
+            return this.get() == other.get();
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+    ///
+    unittest
+    {
+        Nullable!int n1, n2;
+
+        assert(n1 == n2);
+
+        n1 = 0;
+        assert(n1 != n2);
+
+        n2 = 0;
+        assert(n1 == n2);
+    }
+
+    unittest
+    {
+        import std.exception: assertThrown, assertNotThrown;
+
+        Nullable!int n1, n2;
+
+        assertNotThrown!Throwable(n1 == n2);
+
+        n1 = 0;
+        assertNotThrown!Throwable(n1 != n2);
+    }
+
+/**
+Compares a `Nullable!T` with a value of type `T`, `val`. If the
+`Nullable` is in the null state, then it will return false.
+Otherwise, the `Nullable`'s internal value will be compared
+with `val`.
+
+returns:
+    For a `Nullable!T` `n` and a value of type T, `val`:
+        $(UL
+            $(LI false if `n` is null.)
+            $(LI if `n` is non-null, returns the result of the expression `n1.get() == val`.)
+        )
+*/
+    bool opEquals(inout(T) val) inout
+    {
+        return !this.isNull && (this.get() == val);
+    }
+
+    unittest
+    {
+        import std.exception: assertThrown, assertNotThrown;
+
+        Nullable!int n;
+
+        assertNotThrown!Throwable(n != 0);
+        assert(n != 0);
+
+        n = 0;
+        assert(n == 0);
+    }
+
+/**
 Check if `this` is in the null state.
 
 Returns:
